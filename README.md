@@ -1,4 +1,4 @@
-OllaLama
+
 OllaLama is a AI powered Roblox Studio Game Coder/Builder that integrates with Ollama.
 
 OllaLama is an experimental plugin for Roblox Studio that integrates directly with the Ollama ecosystem. It enables developers to use Ollama-powered AI models to assist with scripting, building, and automating workflows inside Studio. The plugin is currently in a rough beta phase, and continued development is planned as the project evolves.
