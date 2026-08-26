@@ -1,0 +1,66 @@
+name: foxit-live-proof
+
+on:
+  workflow_dispatch:
+
+jobs:
+  prove:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      FOXIT_CLIENT_ID: ${{ secrets.FOXIT_CLIENT_ID }}
+      FOXIT_CLIENT_SECRET: ${{ secrets.FOXIT_CLIENT_SECRET }}
+      FOXIT_TEST_SIGNER_EMAIL: ${{ secrets.FOXIT_TEST_SIGNER_EMAIL }}
+      FOXIT_ESIGN_CREATE_URL: https://na1.fusion.foxit.com/esign/api/v1/folders/createfolder
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install TrustFlow
+        run: pip install -e .
+      - name: Verify secrets are configured
+        shell: bash
+        run: |
+          test -n "$FOXIT_CLIENT_ID" || { echo 'FOXIT_CLIENT_ID secret is missing'; exit 2; }
+          test -n "$FOXIT_CLIENT_SECRET" || { echo 'FOXIT_CLIENT_SECRET secret is missing'; exit 2; }
+      - name: Create one non-sent Foxit draft and verify safety boundary
+        shell: bash
+        run: |
+          python - <<'PY'
+          import asyncio
+          import json
+          import os
+
+          from trustflow.pdfutil import text_to_pdf_bytes
+          from trustflow.providers.foxit import FoxitESignProvider
+
+          async def main():
+              provider = FoxitESignProvider(
+                  os.environ['FOXIT_ESIGN_CREATE_URL'],
+                  os.environ['FOXIT_CLIENT_ID'],
+                  os.environ['FOXIT_CLIENT_SECRET'],
+              )
+              pdf = text_to_pdf_bytes(
+                  'TrustFlow Foxit live proof',
+                  'Hackathon integration proof. This envelope must remain a draft and must not be sent.'
+              )
+              result = await provider.create_signature_draft(
+                  pdf,
+                  'TrustFlow',
+                  'Proof',
+                  os.getenv('FOXIT_TEST_SIGNER_EMAIL') or 'trustflow-proof@example.com',
+              )
+              assert result['provider'] == 'foxit', result
+              assert result['send_now'] is False, result
+              assert result.get('folder_id'), result
+              print(json.dumps({
+                  'provider': result['provider'],
+                  'status': result.get('status'),
+                  'folder_id_present': bool(result.get('folder_id')),
+                  'send_now': result['send_now'],
+              }, sort_keys=True))
+
+          asyncio.run(main())
+          PY
