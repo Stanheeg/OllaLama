@@ -2,6 +2,10 @@ name: foxit-live-proof
 
 on:
   workflow_dispatch:
+  push:
+    branches: [trustflow-entry]
+    paths:
+      - '.github/foxit-live-proof-trigger'
 
 jobs:
   prove:
