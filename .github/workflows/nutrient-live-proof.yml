@@ -2,6 +2,11 @@ name: Nutrient live proof
 
 on:
   workflow_dispatch:
+  push:
+    branches:
+      - trustflow-entry
+    paths:
+      - .github/proof-triggers/nutrient.txt
 
 permissions:
   contents: read
