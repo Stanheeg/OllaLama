@@ -1,0 +1,130 @@
+name: Nutrient live proof
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  nutrient-live-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      NUTRIENT_API_KEY: ${{ secrets.NUTRIENT_API_KEY }}
+    steps:
+      - name: Check out TrustFlow
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install TrustFlow
+        run: pip install -e .
+
+      - name: Verify secret is present
+        shell: bash
+        run: |
+          if [ -z "$NUTRIENT_API_KEY" ]; then
+            echo "NUTRIENT_API_KEY repository secret is missing" >&2
+            exit 2
+          fi
+
+      - name: Generate privacy-safe agreement fixture
+        shell: bash
+        run: |
+          python - <<'PY'
+          from pathlib import Path
+          from trustflow.pdfutil import text_to_pdf_bytes
+
+          text = Path('fixtures/sample-agreement.txt').read_text(encoding='utf-8')
+          Path('agreement.pdf').write_bytes(text_to_pdf_bytes('TrustFlow Nutrient Live Proof', text))
+          PY
+
+      - name: Call Nutrient Data Extraction API
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import httpx
+
+          schema = {
+              "type": "object",
+              "properties": {
+                  "parties": {"type": "array", "items": {"type": "string"}},
+                  "governing_law": {"type": ["string", "null"]},
+                  "auto_renewal": {"type": ["boolean", "null"]},
+                  "termination_notice_days": {"type": ["integer", "null"]},
+                  "liability_cap": {"type": ["string", "null"]},
+                  "data_processing": {"type": ["boolean", "null"]},
+                  "signature_required": {"type": "boolean"}
+              },
+              "required": ["parties", "signature_required"]
+          }
+
+          with Path('agreement.pdf').open('rb') as fh:
+              response = httpx.post(
+                  'https://api.nutrient.io/extraction/extract',
+                  headers={'Authorization': f"Bearer {os.environ['NUTRIENT_API_KEY']}"},
+                  files={'file': ('agreement.pdf', fh, 'application/pdf')},
+                  data={'schema': json.dumps(schema, separators=(',', ':'))},
+                  timeout=90.0,
+              )
+
+          raw = response.content
+          Path('nutrient-response.json').write_bytes(raw)
+          if response.status_code >= 400:
+              print(f'Nutrient returned HTTP {response.status_code}', flush=True)
+              try:
+                  print(json.dumps(response.json(), indent=2)[:4000], flush=True)
+              except Exception:
+                  print(response.text[:4000], flush=True)
+              response.raise_for_status()
+
+          data = response.json()
+          expected = set(schema['properties'])
+          observed = set()
+
+          def walk(obj):
+              if isinstance(obj, dict):
+                  observed.update(k for k in obj if k in expected)
+                  for value in obj.values():
+                      walk(value)
+              elif isinstance(obj, list):
+                  for value in obj:
+                      walk(value)
+
+          walk(data)
+          if not observed:
+              raise RuntimeError('Authenticated Nutrient call succeeded but no schema fields were found in the response')
+
+          summary = {
+              'provider': 'Nutrient Data Extraction API',
+              'endpoint': 'https://api.nutrient.io/extraction/extract',
+              'http_status': response.status_code,
+              'response_sha256': hashlib.sha256(raw).hexdigest(),
+              'top_level_keys': sorted(data.keys()) if isinstance(data, dict) else [],
+              'expected_fields_observed': sorted(observed),
+              'expected_field_count': len(expected),
+              'observed_field_count': len(observed),
+              'fixture': 'fixtures/sample-agreement.txt rendered to PDF',
+              'credential_exposed': False
+          }
+          Path('nutrient-proof-summary.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print(json.dumps(summary, indent=2))
+          PY
+
+      - name: Upload sanitized proof artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: nutrient-live-proof
+          path: |
+            nutrient-proof-summary.json
+            nutrient-response.json
+          if-no-files-found: error
+          retention-days: 14
