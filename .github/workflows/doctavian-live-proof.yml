@@ -1,0 +1,245 @@
+name: Doctavian live proof
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [trustflow-entry]
+    paths:
+      - proof/doctavian-trigger.txt
+
+permissions:
+  contents: read
+
+jobs:
+  prove-doctavian:
+    runs-on: ubuntu-latest
+    env:
+      DOCTAVIAN_API_KEY: ${{ secrets.DOCTAVIAN_API_KEY }}
+      DOCTAVIAN_BASE_URL: https://demo.api.doctavian.com
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Require private demo credential
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "${DOCTAVIAN_API_KEY:-}" || { echo "DOCTAVIAN_API_KEY repository secret is required"; exit 2; }
+          test "$DOCTAVIAN_BASE_URL" = "https://demo.api.doctavian.com"
+
+      - name: Run authenticated document-generation proof
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check -q requests
+          python <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          from datetime import datetime, timezone
+
+          import requests
+
+          BASE = os.environ["DOCTAVIAN_BASE_URL"].rstrip("/")
+          KEY = os.environ["DOCTAVIAN_API_KEY"]
+          if BASE != "https://demo.api.doctavian.com":
+              raise SystemExit("Refusing to run outside the sponsor demo environment")
+
+          session = requests.Session()
+          session.headers.update({"X-Api-Key": KEY, "Accept": "application/json"})
+
+          def post_json(path, payload):
+              r = session.post(BASE + path, json=payload, timeout=60)
+              if not r.ok:
+                  raise RuntimeError(f"POST {path} failed: HTTP {r.status_code}: {r.text[:800]}")
+              return r.status_code, r.json()
+
+          def post_file(path, filename, content, mime):
+              r = session.post(
+                  BASE + path,
+                  files={"file": (filename, content, mime)},
+                  timeout=60,
+              )
+              if not r.ok:
+                  raise RuntimeError(f"POST {path} failed: HTTP {r.status_code}: {r.text[:800]}")
+              return r.status_code, r.json()
+
+          # Official hackathon Mission 1 template: deliberately exercises repeaters,
+          # expressions, and a conditional paragraph rather than a throwaway flat merge.
+          template_url = (
+              "https://developers.doctavian.com/openapi/latest/resources/"
+              "mission-1-agreement.docx"
+          )
+          tr = requests.get(template_url, timeout=60)
+          tr.raise_for_status()
+          template_bytes = tr.content
+
+          # Synthetic TrustFlow-shaped evidence packet mapped into the sponsor template's
+          # Customer/LineItems schema. No user or production data is sent to Doctavian.
+          data_payload = {
+              "data": {
+                  "Customer": [{
+                      "Name": "TrustFlow Vendor Approval — Live API Proof",
+                      "AccountId": "TRUSTFLOW-DEMO-001",
+                      "EffectiveDate": "Aug 27, 2026",
+                      "ContractTermMonths": 12,
+                      "LineItems": [
+                          {
+                              "ServiceName": "Vendor evidence collection and provenance",
+                              "Quantity": 1,
+                              "UnitPrice": 5200,
+                              "LineAmount": 5200,
+                          },
+                          {
+                              "ServiceName": "Contract fact extraction and risk review",
+                              "Quantity": 1,
+                              "UnitPrice": 4100,
+                              "LineAmount": 4100,
+                          },
+                          {
+                              "ServiceName": "Human approval and audit-boundary enforcement",
+                              "Quantity": 1,
+                              "UnitPrice": 2800,
+                              "LineAmount": 2800,
+                          },
+                      ],
+                  }]
+              }
+          }
+          data_bytes = json.dumps(data_payload, separators=(",", ":")).encode()
+
+          statuses = {}
+
+          status, ds = post_json(
+              "/v1/documents/datasource/create",
+              {
+                  "name": "TrustFlow Live Proof Data Source",
+                  "description": "Synthetic TrustFlow sponsor-proof data source.",
+                  "variables": "[]",
+                  "loadMethod": "Storage",
+              },
+          )
+          statuses["datasource_create"] = status
+          ds_id = ds["result"]["data"]["dataSourceGuid"]
+
+          status, sol = post_json(
+              "/v1/documents/solution/create",
+              {
+                  "name": "TrustFlow Live Proof Document Solution",
+                  "description": "Doctavian-backed approved-packet generation proof.",
+                  "dataGuid": ds_id,
+              },
+          )
+          statuses["solution_create"] = status
+          solution_id = sol["result"]["data"]["documentSolution"]["documentSolutionGuid"]
+
+          status, uploaded_template = post_file(
+              "/v1/documents/template/upload",
+              "trustflow-proof-template.docx",
+              template_bytes,
+              "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+          )
+          statuses["template_upload"] = status
+          template_id = uploaded_template["result"]["data"]["files"][0]["id"]
+
+          status, uploaded_data = post_file(
+              "/v1/documents/data/upload",
+              "trustflow-proof-data.json",
+              data_bytes,
+              "application/json",
+          )
+          statuses["data_upload"] = status
+          data_id = uploaded_data["result"]["data"]["files"][0]["id"]
+
+          status, generated = post_json(
+              "/v1/documents/document/generate",
+              {
+                  "externalContext": {"id": "trustflow-live-proof"},
+                  "template": {
+                      "name": "trustflow-proof-template.docx",
+                      "urn": template_id,
+                      "fileFormat": "docx",
+                      "loadMethod": "Storage",
+                      "options": {},
+                  },
+                  "data": {
+                      "loadMethod": "Storage",
+                      "urn": data_id,
+                  },
+                  "document": {
+                      "name": "TrustFlow-Approved-Packet-Live-Proof",
+                      "fileFormat": "pdf",
+                      "deliveryMethod": "Storage",
+                      "path": "root",
+                      "locale": "en",
+                      "timezone": "Europe/Amsterdam",
+                      "options": {},
+                  },
+              },
+          )
+          statuses["document_generate"] = status
+          document_urn = generated["result"]["data"]["document"]["urn"]
+
+          dr = session.get(
+              BASE + f"/v1/documents/document/{document_urn}/download",
+              timeout=60,
+          )
+          if not dr.ok:
+              raise RuntimeError(
+                  f"GET generated document failed: HTTP {dr.status_code}: {dr.text[:800]}"
+              )
+          statuses["document_download"] = dr.status_code
+          pdf = dr.content
+          if not pdf.startswith(b"%PDF"):
+              raise RuntimeError("Doctavian download did not return a PDF")
+
+          Path("proof").mkdir(exist_ok=True)
+          pdf_path = Path("proof/doctavian-live-proof.pdf")
+          pdf_path.write_bytes(pdf)
+
+          proof = {
+              "provider": "Doctavian",
+              "environment": "demo",
+              "authenticated": True,
+              "generation_endpoint": "/v1/documents/document/generate",
+              "status_codes": statuses,
+              "data_classification": "synthetic demo data only",
+              "template": "official Mission 1 complex template",
+              "features_exercised": [
+                  "uploaded template",
+                  "uploaded structured data",
+                  "repeater-driven line items",
+                  "conditional clause",
+                  "synchronous PDF generation",
+                  "generated-document download",
+              ],
+              "datasource_id": ds_id,
+              "document_solution_id": solution_id,
+              "template_id": template_id,
+              "data_id": data_id,
+              "generated_document_urn": document_urn,
+              "pdf_sha256": hashlib.sha256(pdf).hexdigest(),
+              "pdf_bytes": len(pdf),
+              "verified_at_utc": datetime.now(timezone.utc).isoformat(),
+          }
+          Path("proof/doctavian-live-proof.json").write_text(
+              json.dumps(proof, indent=2, sort_keys=True), encoding="utf-8"
+          )
+          print(json.dumps({
+              "provider": proof["provider"],
+              "authenticated": proof["authenticated"],
+              "document_generate_status": statuses["document_generate"],
+              "pdf_bytes": proof["pdf_bytes"],
+              "pdf_sha256": proof["pdf_sha256"],
+          }, indent=2))
+          PY
+
+      - name: Upload sanitized proof artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: doctavian-live-proof
+          path: |
+            proof/doctavian-live-proof.json
+            proof/doctavian-live-proof.pdf
+          if-no-files-found: error
+          retention-days: 30
