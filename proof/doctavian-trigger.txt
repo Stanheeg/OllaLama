@@ -1,0 +1,1 @@
+Trigger Doctavian live proof from server-side GitHub Actions.
