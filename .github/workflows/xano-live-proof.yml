@@ -1,0 +1,157 @@
+name: Xano authenticated live proof
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - trustflow-entry
+    paths:
+      - .github/proof-triggers/xano.txt
+
+permissions:
+  contents: read
+
+jobs:
+  xano-live-proof:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      XANO_ACCESS_TOKEN: ${{ secrets.XANO_ACCESS_TOKEN }}
+    steps:
+      - name: Check out TrustFlow
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Verify Xano secret is present
+        shell: bash
+        run: |
+          if [ -z "$XANO_ACCESS_TOKEN" ]; then
+            echo "XANO_ACCESS_TOKEN repository secret is missing" >&2
+            exit 2
+          fi
+
+      - name: Validate Xano account and discover provisioned resources
+        shell: bash
+        run: |
+          python - <<'PY'
+          import hashlib
+          import json
+          import os
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          token = os.environ['XANO_ACCESS_TOKEN']
+          headers = {
+              'Authorization': f'Bearer {token}',
+              'Accept': 'application/json',
+              'User-Agent': 'TrustFlow-DevNetwork-2026',
+          }
+
+          def get_json(url):
+              req = urllib.request.Request(url, headers=headers, method='GET')
+              try:
+                  with urllib.request.urlopen(req, timeout=30) as resp:
+                      raw = resp.read()
+                      status = resp.status
+              except urllib.error.HTTPError as exc:
+                  body = exc.read().decode('utf-8', errors='replace')[:1000]
+                  raise RuntimeError(f'Xano request failed with HTTP {exc.code}: {body}') from exc
+              if status >= 400:
+                  raise RuntimeError(f'Xano request failed with HTTP {status}')
+              try:
+                  return status, json.loads(raw.decode('utf-8'))
+              except Exception as exc:
+                  raise RuntimeError('Xano returned a non-JSON response') from exc
+
+          def items(value):
+              if isinstance(value, list):
+                  return value
+              if isinstance(value, dict):
+                  for key in ('items', 'data', 'result', 'instances', 'workspaces'):
+                      candidate = value.get(key)
+                      if isinstance(candidate, list):
+                          return candidate
+              return []
+
+          def digest(value):
+              return hashlib.sha256(str(value).encode('utf-8')).hexdigest()[:16]
+
+          auth_status, auth = get_json('https://app.xano.com/api:meta/auth/me')
+          instance_status, instance_payload = get_json('https://app.xano.com/api:meta/instance')
+          instances = items(instance_payload)
+          if not instances:
+              raise RuntimeError('Authenticated Xano account has no discoverable instances')
+
+          # Prefer a uniquely identifiable provisioned/TrustFlow instance, otherwise
+          # only proceed automatically when the account exposes exactly one instance.
+          preferred = []
+          for inst in instances:
+              label = ' '.join(str(inst.get(k, '')) for k in ('name', 'display')).lower()
+              if 'trustflow' in label or 'essential' in label:
+                  preferred.append(inst)
+          if len(preferred) == 1:
+              instance = preferred[0]
+              selection_reason = 'unique_named_match'
+          elif len(instances) == 1:
+              instance = instances[0]
+              selection_reason = 'only_instance'
+          else:
+              raise RuntimeError(
+                  f'Found {len(instances)} Xano instances and could not select one safely without exposing private identifiers'
+              )
+
+          meta_api = instance.get('meta_api')
+          if not isinstance(meta_api, str) or not meta_api.startswith('https://'):
+              raise RuntimeError('Selected Xano instance does not expose a valid Metadata API URL')
+
+          workspace_status, workspace_payload = get_json(meta_api.rstrip('/') + '/workspace')
+          workspaces = items(workspace_payload)
+
+          safe_instance_fingerprint = digest(
+              '|'.join(str(instance.get(k, '')) for k in ('name', 'display', 'xano_domain', 'meta_api'))
+          )
+          workspace_fingerprints = sorted(
+              digest('|'.join(str(ws.get(k, '')) for k in ('id', 'name', 'description'))) for ws in workspaces
+          )
+
+          summary = {
+              'provider': 'Xano Metadata API',
+              'authenticated': True,
+              'auth_http_status': auth_status,
+              'instance_list_http_status': instance_status,
+              'workspace_list_http_status': workspace_status,
+              'instance_count': len(instances),
+              'selected_instance_fingerprint': safe_instance_fingerprint,
+              'selection_reason': selection_reason,
+              'workspace_count': len(workspaces),
+              'workspace_fingerprints': workspace_fingerprints,
+              'account_identity_present': isinstance(auth, dict) and bool(auth),
+              'contains_raw_token': False,
+              'contains_private_endpoint': False,
+              'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+              'claim': 'Authenticated Xano access and provisioned resource discovery only; this does not yet prove TrustFlow workflow/audit writes.',
+          }
+
+          Path('xano-live-proof.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
+          print(json.dumps({
+              'provider': summary['provider'],
+              'authenticated': summary['authenticated'],
+              'instance_count': summary['instance_count'],
+              'workspace_count': summary['workspace_count'],
+              'claim': summary['claim'],
+          }, indent=2))
+          PY
+
+      - name: Upload privacy-safe proof artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: xano-authenticated-live-proof
+          path: xano-live-proof.json
+          if-no-files-found: error
+          retention-days: 7
